@@ -22,21 +22,28 @@ jobs:
           # 1. 解压仓库中的压缩包
           find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
 
-          # 2. 精确找到 Package.swift 所在的主目录（按最新修改时间排序，杜绝抓错旧版本）
-          TARGET_DIR=$(find . -name "Package.swift" -not -path "*/.*" -print0 | xargs -0 ls -td | head -n 1 | xargs dirname)
+          # 2. 安全查找包含 Package.swift 的主目录（严格加引号，防止空格/中文被切断）
+          TARGET_DIR=""
+          while IFS= read -r pkg_file; do
+            DIR=$(dirname "$pkg_file")
+            if [ -z "$TARGET_DIR" ] || [ "$pkg_file" -nt "$TARGET_DIR/Package.swift" ]; then
+              TARGET_DIR="$DIR"
+            fi
+          done < <(find . -name "Package.swift" -not -path "*/.*")
+
           if [ -z "$TARGET_DIR" ]; then
             echo "❌ 未找到 Package.swift 目录"
             exit 1
           fi
-          echo "✅ 锁定最新源码目录: $TARGET_DIR"
+          echo "✅ 锁定最新源码目录: \"$TARGET_DIR\""
           
           rm -rf AppSource
+          # 带引号移动，杜绝任何空格截断错误
           mv "$TARGET_DIR" AppSource
           find AppSource -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
 
       - name: 注入原生兼容补丁（保护原版代码零改动）
         run: |
-          # 在工程中单独注入一个补丁文件，不碰你的任何原有文件
           cat << 'EOF' > AppSource/CompatibilityStubs.swift
           import SwiftUI
 
