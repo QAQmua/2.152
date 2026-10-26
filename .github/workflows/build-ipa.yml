@@ -41,23 +41,43 @@ jobs:
           mv "$TARGET_DIR" AppSource
           find AppSource -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
 
-      - name: 仅在云端接驳信息模块接口（保护原版其余所有文件）
+      - name: 仅在云端修补信息模块的编译报错（其他文件完全原封不动）
         run: |
           python3 -c "
-          import os, re
-          target = 'AppSource/信息/MessagesChatDetailView.swift'
-          if os.path.exists(target):
-              with open(target, 'r', encoding='utf-8') as f:
+          import glob, re
+
+          files = glob.glob('AppSource/**/MessagesChatDetailView.swift', recursive=True)
+          for p in files:
+              with open(p, 'r', encoding='utf-8') as f:
                   code = f.read()
-              # 1. 修复报 3 failures 的 safeAreaBar 底部修饰器
-              code = re.sub(r'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier \{[\s\S]*?body\(content: Content\) -> some View \{[\s\S]*?\}\s*\}', 'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier {\n    @ViewBuilder let barContent: () -> BarContent\n    func body(content: Content) -> some View {\n        content.safeAreaInset(edge: .bottom) { barContent() }\n    }\n}', code)
-              # 2. 修复信息顶栏与输入框
-              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*ToolbarItem\(placement: \.principal\)\s*\{\s*principalHeaderItem\s*\}\s*\.sharedBackgroundVisibility\(\.hidden\)\s*\}\s*else\s*\{', 'ToolbarItem(placement: .principal) { principalHeaderItem } //', code)
-              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*namePill\s*\.glassEffect\([^)]*\)\s*\.padding\(\.top,\s*53\)\s*\}\s*else\s*\{', '{\n                    namePill.background(.regularMaterial, in: Capsule()).padding(.top, 53)', code)
-              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*GlassEffectContainer[\s\S]*?\}\s*else\s*\{', '{', code)
-              with open(target, 'w', encoding='utf-8') as f:
+
+              # 1. 修复造成 3 failures 的 safeAreaBar 结构
+              code = re.sub(
+                  r'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier \{[\s\S]*?body\(content: Content\) -> some View \{[\s\S]*?\}\s*\}',
+                  'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier {\n    @ViewBuilder let barContent: () -> BarContent\n    func body(content: Content) -> some View {\n        content.safeAreaInset(edge: .bottom) { barContent() }\n    }\n}',
+                  code
+              )
+
+              # 2. 修复顶栏与输入框的虚构 API
+              code = re.sub(
+                  r'if #available\(iOS 26\.0, \*\)\s*\{\s*ToolbarItem\(placement: \.principal\)\s*\{\s*principalHeaderItem\s*\}\s*\.sharedBackgroundVisibility\(\.hidden\)\s*\}\s*else\s*\{',
+                  'ToolbarItem(placement: .principal) { principalHeaderItem } //',
+                  code
+              )
+              code = re.sub(
+                  r'if #available\(iOS 26\.0, \*\)\s*\{\s*namePill\s*\.glassEffect\([^)]*\)\s*\.padding\(\.top,\s*53\)\s*\}\s*else\s*\{',
+                  '{\n                    namePill.background(.regularMaterial, in: Capsule()).padding(.top, 53)',
+                  code
+              )
+              code = re.sub(
+                  r'if #available\(iOS 26\.0, \*\)\s*\{\s*GlassEffectContainer[\s\S]*?\}\s*else\s*\{',
+                  '{',
+                  code
+              )
+
+              with open(p, 'w', encoding='utf-8') as f:
                   f.write(code)
-              print('✅ 信息模块接口接驳完成')
+              print('✅ 成功修补信息模块:', p)
           "
 
       - name: 执行原版编译与打包 IPA
@@ -67,7 +87,8 @@ jobs:
           if [ -z "$SCHEME" ]; then SCHEME="AppModule"; fi
           echo "正在构建 Scheme: $SCHEME"
 
-          # 1. 编译
+          # 1. 编译并捕获详细日志
+          set +e
           xcodebuild build \
             -scheme "$SCHEME" \
             -destination "generic/platform=iOS" \
@@ -77,7 +98,17 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO \
-            ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS=NO
+            ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS=NO > build.log 2>&1
+          
+          BUILD_STATUS=$?
+          if [ $BUILD_STATUS -ne 0 ]; then
+            echo "==================== [ 核心错误详细定位 ] ===================="
+            grep -C 2 -E "error:" build.log | grep -v "ResultBundle" | head -n 40
+            echo "=============================================================="
+            tail -n 40 build.log
+            exit $BUILD_STATUS
+          fi
+          set -e
 
           # 2. 定位编译产物目录
           PRODUCTS_DIR=$(find ./build -type d -path "*/Build/Products/Release-iphoneos" | head -n 1)
