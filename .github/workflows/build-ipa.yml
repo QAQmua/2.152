@@ -17,12 +17,12 @@ jobs:
         run: |
           xcodebuild -version
 
-      - name: 规整并精确定位最新工程目录
+      - name: 规整最新工程目录
         run: |
-          # 1. 解压仓库中的压缩包
+          # 1. 解压所有 zip 包
           find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
 
-          # 2. 安全查找包含 Package.swift 的主目录（严格加引号，防止空格/中文被切断）
+          # 2. 安全查找并定位主目录（兼容中文与空格）
           TARGET_DIR=""
           while IFS= read -r pkg_file; do
             DIR=$(dirname "$pkg_file")
@@ -35,62 +35,30 @@ jobs:
             echo "❌ 未找到 Package.swift 目录"
             exit 1
           fi
-          echo "✅ 锁定最新源码目录: \"$TARGET_DIR\""
+          echo "✅ 锁定最新工程: \"$TARGET_DIR\""
           
           rm -rf AppSource
-          # 带引号移动，杜绝任何空格截断错误
           mv "$TARGET_DIR" AppSource
           find AppSource -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
 
-      - name: 注入原生兼容补丁（保护原版代码零改动）
+      - name: 仅在云端接驳信息模块接口（保护原版其余所有文件）
         run: |
-          cat << 'EOF' > AppSource/CompatibilityStubs.swift
-          import SwiftUI
-
-          public struct ScrollEdgeEffectStyle: Sendable {
-              public static let soft = ScrollEdgeEffectStyle()
-              public static let hard = ScrollEdgeEffectStyle()
-              public static let automatic = ScrollEdgeEffectStyle()
-          }
-
-          public extension View {
-              @ViewBuilder
-              func safeAreaBar<Content: View>(
-                  edge: VerticalEdge = .bottom,
-                  @ViewBuilder content: () -> Content
-              ) -> some View {
-                  self.safeAreaInset(edge: edge, content: content)
-              }
-
-              @ViewBuilder
-              func scrollEdgeEffectStyle(
-                  _ style: ScrollEdgeEffectStyle,
-                  for edge: VerticalEdge
-              ) -> some View {
-                  self
-              }
-
-              @ViewBuilder
-              func glassEffect<S: Shape>(_ style: Int = 0, in shape: S) -> some View {
-                  self.background(.ultraThinMaterial, in: shape)
-              }
-
-              @ViewBuilder
-              func glassEffect<S: InsettableShape>(_ style: Int = 0, in shape: S) -> some View {
-                  self.background(.ultraThinMaterial, in: shape)
-              }
-          }
-
-          public struct GlassEffectContainer<Content: View>: View {
-              let spacing: CGFloat
-              @ViewBuilder let content: () -> Content
-              public init(spacing: CGFloat = 0, @ViewBuilder content: @escaping () -> Content) {
-                  self.spacing = spacing
-                  self.content = content
-              }
-              public var body: some View { content() }
-          }
-          EOF
+          python3 -c "
+          import os, re
+          target = 'AppSource/信息/MessagesChatDetailView.swift'
+          if os.path.exists(target):
+              with open(target, 'r', encoding='utf-8') as f:
+                  code = f.read()
+              # 1. 修复报 3 failures 的 safeAreaBar 底部修饰器
+              code = re.sub(r'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier \{[\s\S]*?body\(content: Content\) -> some View \{[\s\S]*?\}\s*\}', 'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier {\n    @ViewBuilder let barContent: () -> BarContent\n    func body(content: Content) -> some View {\n        content.safeAreaInset(edge: .bottom) { barContent() }\n    }\n}', code)
+              # 2. 修复信息顶栏与输入框
+              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*ToolbarItem\(placement: \.principal\)\s*\{\s*principalHeaderItem\s*\}\s*\.sharedBackgroundVisibility\(\.hidden\)\s*\}\s*else\s*\{', 'ToolbarItem(placement: .principal) { principalHeaderItem } //', code)
+              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*namePill\s*\.glassEffect\([^)]*\)\s*\.padding\(\.top,\s*53\)\s*\}\s*else\s*\{', '{\n                    namePill.background(.regularMaterial, in: Capsule()).padding(.top, 53)', code)
+              code = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*GlassEffectContainer[\s\S]*?\}\s*else\s*\{', '{', code)
+              with open(target, 'w', encoding='utf-8') as f:
+                  f.write(code)
+              print('✅ 信息模块接口接驳完成')
+          "
 
       - name: 执行原版编译与打包 IPA
         run: |
@@ -134,7 +102,7 @@ jobs:
             cp -R "$bndl/"* Payload/YouDao.app/ 2>/dev/null || true
           done
 
-          # (3) 动态库（安全防空）
+          # (3) 动态库（安全防空跳过）
           if [ -d "$PRODUCTS_DIR/PackageFrameworks" ] && [ "$(ls -A "$PRODUCTS_DIR/PackageFrameworks" 2>/dev/null)" ]; then
             mkdir -p Payload/YouDao.app/Frameworks
             cp -R "$PRODUCTS_DIR/PackageFrameworks/"* Payload/YouDao.app/Frameworks/ 2>/dev/null || true
