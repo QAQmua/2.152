@@ -17,19 +17,75 @@ jobs:
         run: |
           xcodebuild -version
 
-      - name: 规整工程目录
+      - name: 规整并精确定位最新工程目录
         run: |
+          # 1. 解压仓库中的压缩包
           find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
-          TARGET_DIR=$(find . -name "Package.swift" -not -path "*/.*" -exec dirname {} \; | head -n 1)
+
+          # 2. 精确找到 Package.swift 所在的主目录（按最新修改时间排序，杜绝抓错旧版本）
+          TARGET_DIR=$(find . -name "Package.swift" -not -path "*/.*" -print0 | xargs -0 ls -td | head -n 1 | xargs dirname)
           if [ -z "$TARGET_DIR" ]; then
             echo "❌ 未找到 Package.swift 目录"
             exit 1
           fi
+          echo "✅ 锁定最新源码目录: $TARGET_DIR"
+          
           rm -rf AppSource
           mv "$TARGET_DIR" AppSource
           find AppSource -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
 
-      - name: 执行编译与自动装配 IPA
+      - name: 注入原生兼容补丁（保护原版代码零改动）
+        run: |
+          # 在工程中单独注入一个补丁文件，不碰你的任何原有文件
+          cat << 'EOF' > AppSource/CompatibilityStubs.swift
+          import SwiftUI
+
+          public struct ScrollEdgeEffectStyle: Sendable {
+              public static let soft = ScrollEdgeEffectStyle()
+              public static let hard = ScrollEdgeEffectStyle()
+              public static let automatic = ScrollEdgeEffectStyle()
+          }
+
+          public extension View {
+              @ViewBuilder
+              func safeAreaBar<Content: View>(
+                  edge: VerticalEdge = .bottom,
+                  @ViewBuilder content: () -> Content
+              ) -> some View {
+                  self.safeAreaInset(edge: edge, content: content)
+              }
+
+              @ViewBuilder
+              func scrollEdgeEffectStyle(
+                  _ style: ScrollEdgeEffectStyle,
+                  for edge: VerticalEdge
+              ) -> some View {
+                  self
+              }
+
+              @ViewBuilder
+              func glassEffect<S: Shape>(_ style: Int = 0, in shape: S) -> some View {
+                  self.background(.ultraThinMaterial, in: shape)
+              }
+
+              @ViewBuilder
+              func glassEffect<S: InsettableShape>(_ style: Int = 0, in shape: S) -> some View {
+                  self.background(.ultraThinMaterial, in: shape)
+              }
+          }
+
+          public struct GlassEffectContainer<Content: View>: View {
+              let spacing: CGFloat
+              @ViewBuilder let content: () -> Content
+              public init(spacing: CGFloat = 0, @ViewBuilder content: @escaping () -> Content) {
+                  self.spacing = spacing
+                  self.content = content
+              }
+              public var body: some View { content() }
+          }
+          EOF
+
+      - name: 执行原版编译与打包 IPA
         run: |
           cd AppSource
           SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
@@ -48,38 +104,36 @@ jobs:
             ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO \
             ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS=NO
 
-          # 2. 定位 Products 成品目录
+          # 2. 定位编译产物目录
           PRODUCTS_DIR=$(find ./build -type d -path "*/Build/Products/Release-iphoneos" | head -n 1)
           if [ -z "$PRODUCTS_DIR" ]; then
             PRODUCTS_DIR="./build/Build/Products/Release-iphoneos"
           fi
-          echo "✅ 最终成品目录: $PRODUCTS_DIR"
+          echo "✅ 产物目录: $PRODUCTS_DIR"
 
-          # 3. 创建标准 iOS .app 目录结构
+          # 3. 创建标准 iOS .app 结构
           mkdir -p Payload/YouDao.app
 
-          # (1) 复制主程序
+          # (1) 装配主程序
           APP_BIN=$(find "$PRODUCTS_DIR" -maxdepth 1 -type f ! -name "*.*" ! -name ".*" | head -n 1)
-          if [ -z "$APP_BIN" ]; then
-            APP_BIN="$PRODUCTS_DIR/幼刀"
-          fi
-          echo "✅ 复制主程序: $APP_BIN"
+          if [ -z "$APP_BIN" ]; then APP_BIN="$PRODUCTS_DIR/幼刀"; fi
+          echo "✅ 装配主程序: $APP_BIN"
           cp "$APP_BIN" Payload/YouDao.app/YouDao
           chmod +x Payload/YouDao.app/YouDao
 
-          # (2) 合并资源包
+          # (2) 复制资源包 (Assets/Bundle)
           find "$PRODUCTS_DIR" -maxdepth 1 -type d -name "*.bundle" | while read -r bndl; do
             echo "✅ 合并资源包: $bndl"
             cp -R "$bndl/"* Payload/YouDao.app/ 2>/dev/null || true
           done
 
-          # (3) 动态库（空文件夹直接跳过，不报错）
+          # (3) 动态库（安全防空）
           if [ -d "$PRODUCTS_DIR/PackageFrameworks" ] && [ "$(ls -A "$PRODUCTS_DIR/PackageFrameworks" 2>/dev/null)" ]; then
             mkdir -p Payload/YouDao.app/Frameworks
             cp -R "$PRODUCTS_DIR/PackageFrameworks/"* Payload/YouDao.app/Frameworks/ 2>/dev/null || true
           fi
 
-          # 4. 补齐并更新标准 Info.plist
+          # 4. 写入标准 Info.plist
           PLIST_PATH="Payload/YouDao.app/Info.plist"
           if [ ! -f "$PLIST_PATH" ]; then
             plutil -create xml1 "$PLIST_PATH"
@@ -96,7 +150,7 @@ jobs:
           # 5. 打包生成 IPA
           zip -qry output.ipa Payload
           mv output.ipa "$GITHUB_WORKSPACE/YouDao.ipa"
-          echo "🎉 YouDao.ipa 制作成功！"
+          echo "🎉 原版项目 YouDao.ipa 制作成功！"
 
       - name: 发布 Release 并提供 IPA 下载
         uses: softprops/action-gh-release@v2
